@@ -1,0 +1,291 @@
+rules_version = '2';
+
+// =====================================================================
+// قواعد حماية Firestore — الحرف المتكاملة للمقاولات
+// ---------------------------------------------------------------------
+// المبادئ:
+//  1) لا يقرأ أحد شيئاً إلا مستخدم نشط مسجّل في users (أو المالك "1").
+//  2) كل صلاحية تُفحص على الخادم من مستند المستخدم (perms)، لا من المتصفح.
+//  3) لا حذف نهائي لأي سجل مالي؛ الإلغاء يكون بقيد عكسي.
+//  4) القيد المرحّل والفاتورة المُصدرة لا تتغير مبالغهما بعد ذلك أبداً.
+//  5) فصل المهام: لا يعتمد مستخدم قيداً أنشأه بنفسه (حتى المالك).
+//  6) كل كتابة يجب أن يرافقها سطر جديد في سجل المراجعة، كُتب في نفس
+//     الطلب بوقت الخادم وباسم نفس المستخدم؛ وسجل المراجعة لا يُعدَّل ولا يُحذف.
+//  حد Firestore: 20 فحص مستندات لكل معاملة؛ كل كتابة هنا تستهلك فحصين كحد أقصى.
+// =====================================================================
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- الهوية والصلاحيات ----------
+    function signedIn() { return request.auth != null && request.auth.token.email is string; }
+    function uname() { return request.auth.token.email.split('@')[0]; }
+    function isOwner() { return signedIn() && request.auth.token.email == '1@al-hiraf.app'; }
+    function me() { return get(/databases/$(database)/documents/users/$(uname())).data; }
+    function isMember() { return isOwner() || (signedIn() && me().active == true); }
+    function hasAnyPerm(ps) { let u = me(); return u.active == true && u.perms.hasAny(ps); }
+    function canAny(ps) { return isOwner() || (signedIn() && hasAnyPerm(ps)); }
+
+    // ---------- أدوات ----------
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function changedOnly(keys) { return incoming().diff(existing()).affectedKeys().hasOnly(keys); }
+    function money(v) { return v is int && v >= 0 && v <= 9000000000000000; }
+    // سطر مراجعة جديد بنفس المستخدم وبوقت هذا الطلب نفسه
+    function audited() {
+      let a = getAfter(/databases/$(database)/documents/audit/$(incoming().auditId)).data;
+      return a.actor == uname() && a.at == request.time;
+    }
+    function balanced() {
+      let d = incoming();
+      return d.totalDebitH is int && d.totalDebitH > 0 && d.totalDebitH == d.totalCreditH
+        && d.totalDebitH <= 9000000000000000
+        && d.lines is list && d.lines.size() >= 2 && d.lines.size() <= 100;
+    }
+
+    // ---------- سجل المراجعة: إضافة فقط ----------
+    match /audit/{id} {
+      allow read: if canAny(['audit.view']);
+      allow create: if isMember()
+        && incoming().actor == uname()
+        && incoming().at == request.time
+        && incoming().keys().hasOnly(['at', 'actor', 'actorName', 'action', 'entity', 'entityId', 'summary'])
+        && incoming().summary is string && incoming().summary.size() <= 300;
+      allow update, delete: if false;
+    }
+
+    // ---------- المستخدمون ----------
+    match /users/{u} {
+      allow read: if isMember() || (signedIn() && u == uname());
+      allow create: if canAny(['users.manage']) && audited()
+        && u.matches('^[a-z0-9][a-z0-9._-]{0,29}$')
+        && incoming().active == true && incoming().deleted == false && incoming().perms is list;
+      allow update: if canAny(['users.manage']) && audited()
+        && incoming().perms is list
+        && (u != '1' || (isOwner() && incoming().active == true && incoming().deleted == false))
+        && (u != uname() || incoming().active == true);
+      allow delete: if false;
+    }
+
+    // ---------- الإعدادات ----------
+    // قراءة المجموعة كاملة (يستمع لها البرنامج لحظياً)؛ الكتابة محددة لكل مستند أدناه
+    match /settings/{doc} {
+      allow read: if isMember();
+    }
+    match /settings/company {
+      allow read: if isMember();
+      allow write: if canAny(['settings.write']) && audited();
+    }
+    // الصفحة التعريفية: قراءة عامة بلا دخول، والكتابة لمن يعدّل بيانات المنشأة
+    match /settings/public {
+      allow read: if true;
+      allow write: if canAny(['settings.write']) && audited()
+        && incoming().about is string && incoming().about.size() <= 1500
+        && incoming().services is list && incoming().services.size() <= 16
+        && incoming().projects is list && incoming().projects.size() <= 12;
+    }
+    match /settings/ai {
+      allow read: if isMember();
+      allow write: if canAny(['settings.write']) && audited();
+    }
+    match /settings/hr {
+      allow read: if isMember();
+      allow write: if canAny(['hr.manage']) && audited();
+    }
+    match /settings/counters {
+      allow read: if isMember();
+      allow create, update: if audited();
+      allow delete: if false;
+    }
+
+    // ---------- دليل الحسابات ----------
+    match /accounts/{id} {
+      allow read: if isMember();
+      allow create: if canAny(['accounts.write']) && audited()
+        && incoming().type in ['Assets', 'Liabilities', 'Equity', 'Revenue', 'Expenses'];
+      allow update: if canAny(['accounts.write']) && audited()
+        && changedOnly(['name', 'archived', 'auditId', 'updatedAt', 'updatedBy']);
+      allow delete: if false;
+    }
+
+    // ---------- العملاء ----------
+    match /customers/{id} {
+      allow read: if isMember();
+      allow create: if canAny(['customer.write']) && audited()
+        && incoming().createdBy == uname()
+        && incoming().name is string && incoming().name.size() > 0 && incoming().name.size() <= 120;
+      allow update: if canAny(['customer.write']) && audited()
+        && !incoming().diff(existing()).affectedKeys().hasAny(['createdBy', 'createdAt']);
+      allow delete: if false;
+    }
+
+    // ---------- الفواتير ----------
+    match /invoices/{id} {
+      allow read: if isMember();
+      allow create: if canAny(['invoice.write']) && audited()
+        && incoming().status == 'draft' && incoming().createdBy == uname()
+        && incoming().paidH == 0 && money(incoming().totalH);
+      allow update: if audited() && (
+        // تعديل المسودة
+        (existing().status == 'draft' && incoming().status == 'draft' && canAny(['invoice.write']))
+        // إلغاء المسودة
+        || (existing().status == 'draft' && incoming().status == 'cancelled' && canAny(['invoice.write'])
+            && changedOnly(['status', 'auditId', 'updatedAt', 'updatedBy']))
+        // الإصدار
+        || (existing().status == 'draft' && incoming().status == 'issued' && canAny(['invoice.issue'])
+            && incoming().paidH == 0 && money(incoming().totalH) && incoming().number is string)
+        // تحديث المدفوع فقط (سند قبض أو عكسه) ولا يتجاوز الإجمالي
+        || (existing().status == 'issued' && incoming().status == 'issued' && canAny(['payment.create', 'payment.reverse'])
+            && changedOnly(['paidH', 'auditId', 'updatedAt', 'updatedBy'])
+            && money(incoming().paidH) && incoming().paidH <= existing().totalH)
+        // إلغاء فاتورة مُصدرة غير مدفوعة
+        || (existing().status == 'issued' && incoming().status == 'void' && canAny(['invoice.void'])
+            && existing().paidH == 0
+            && changedOnly(['status', 'voidReason', 'voidedBy', 'voidedAt', 'voidedDate', 'journalIds', 'auditId', 'updatedAt', 'updatedBy']))
+      );
+      allow delete: if false;
+    }
+
+    // ---------- سندات القبض ----------
+    match /payments/{id} {
+      allow read: if isMember();
+      allow create: if canAny(['payment.create']) && audited()
+        && incoming().status == 'active' && incoming().createdBy == uname()
+        && money(incoming().amountH) && incoming().amountH > 0;
+      allow update: if canAny(['payment.reverse']) && audited()
+        && existing().status == 'active' && incoming().status == 'reversed'
+        && changedOnly(['status', 'reversedBy', 'reversedAt', 'reverseReason', 'journalIds', 'auditId', 'updatedAt', 'updatedBy']);
+      allow delete: if false;
+    }
+
+    // ---------- القيود ----------
+    match /journals/{id} {
+      allow read: if isMember();
+      allow create: if audited() && balanced() && incoming().createdBy == uname() && (
+        (incoming().source == 'manual' && incoming().status == 'draft' && canAny(['journal.create']))
+        || (incoming().status == 'posted' && (
+             (incoming().source == 'invoice' && canAny(['invoice.issue']))
+          || (incoming().source == 'void' && canAny(['invoice.void']))
+          || (incoming().source == 'payment' && canAny(['payment.create']))
+          || (incoming().source == 'reversal' && canAny(['payment.reverse', 'journal.reverse']))
+          || (incoming().source == 'purchase' && canAny(['inventory.write', 'bank.import']))
+          || (incoming().source == 'bank' && canAny(['bank.import']))
+          || (incoming().source in ['advance', 'eos'] && canAny(['hr.manage']))
+          || (incoming().source == 'payroll' && canAny(['payroll.run']))
+          || (incoming().source == 'asset' && canAny(['asset.write']))
+          || (incoming().source == 'depreciation' && canAny(['dep.run']))
+        ))
+      );
+      allow update: if audited() && (
+        // يعدّل المنشئ مسودته فقط
+        (existing().status == 'draft' && incoming().status == 'draft' && existing().createdBy == uname() && balanced()
+          && changedOnly(['date', 'memo', 'lines', 'totalDebitH', 'totalCreditH', 'auditId', 'updatedAt', 'updatedBy']))
+        // الاعتماد: صلاحية + ليس منشئ القيد (فصل المهام)، ولا تتغير الأسطر
+        || (existing().status == 'draft' && incoming().status == 'posted' && existing().createdBy != uname() && canAny(['journal.post'])
+          && changedOnly(['status', 'postedBy', 'postedAt', 'auditId', 'updatedAt', 'updatedBy']))
+        // إلغاء أو رفض قيد غير معتمد
+        || (existing().status == 'draft' && incoming().status == 'cancelled'
+          && (existing().createdBy == uname() || canAny(['journal.post']))
+          && changedOnly(['status', 'cancelledBy', 'cancelledAt', 'cancelReason', 'auditId', 'updatedAt', 'updatedBy']))
+        // عكس قيد يدوي أو قيد من كشف الحساب
+        || (existing().status == 'posted' && incoming().status == 'reversed' && existing().source in ['manual', 'bank'] && canAny(['journal.reverse'])
+          && changedOnly(['status', 'reversedBy', 'reversedAt', 'reversalId', 'auditId', 'updatedAt', 'updatedBy']))
+      );
+      allow delete: if false;
+    }
+
+    // ---------- المخزون ----------
+    match /items/{id} {
+      allow read: if isMember();
+      allow create: if canAny(['inventory.write']) && audited()
+        && incoming().qtyM == 0 && incoming().valueH == 0 && incoming().method in ['FIFO', 'AVG'];
+      // التحديث يأتي من المشتريات والفواتير وإلغائها؛ يُشترط سطر مراجعة وقيم صحيحة غير سالبة
+      allow update: if audited()
+        && incoming().qtyM is int && incoming().qtyM >= 0 && money(incoming().valueH)
+        && incoming().method in ['FIFO', 'AVG'];
+      allow delete: if false;
+    }
+    match /stockMoves/{id} {
+      allow read: if isMember();
+      allow create: if audited() && incoming().type in ['in', 'out']
+        && incoming().qtyM is int && incoming().qtyM > 0 && money(incoming().costH);
+      allow update, delete: if false;
+    }
+    match /purchases/{id} {
+      allow read: if isMember();
+      allow create: if canAny(['inventory.write', 'bank.import']) && audited()
+        && money(incoming().totalH) && incoming().totalH == incoming().netH + incoming().vatH;
+      allow update, delete: if false;
+    }
+
+    // ---------- الأصول والإهلاك ----------
+    match /assets/{id} {
+      allow read: if isMember();
+      allow create: if canAny(['asset.write']) && audited()
+        && money(incoming().costH) && money(incoming().salvageH) && incoming().salvageH < incoming().costH
+        && incoming().lifeMonths is int && incoming().lifeMonths > 0 && incoming().lifeMonths <= 600;
+      allow update, delete: if false;
+    }
+    match /depRuns/{month} {
+      allow read: if isMember();
+      allow create: if canAny(['dep.run']) && audited() && money(incoming().totalH);
+      allow update, delete: if false;
+    }
+
+    // ---------- الموارد البشرية: الرواتب لا يطّلع عليها إلا الموارد البشرية والرواتب والمراجع ----------
+    function hrRead() { return canAny(['hr.manage', 'payroll.run', 'audit.view']); }
+    match /employees/{id} {
+      allow read: if hrRead();
+      allow create: if canAny(['hr.manage']) && audited()
+        && incoming().status == 'active' && money(incoming().basicH) && incoming().basicH > 0;
+      allow update: if canAny(['hr.manage']) && audited() && existing().status == 'active'
+        && incoming().status in ['active', 'terminated'] && money(incoming().basicH);
+      allow delete: if false;
+    }
+    match /advances/{id} {
+      allow read: if hrRead();
+      allow create: if canAny(['hr.manage']) && audited() && money(incoming().amountH) && incoming().amountH > 0;
+      allow update, delete: if false;
+    }
+    match /payrolls/{month} {
+      allow read: if hrRead();
+      allow create: if canAny(['payroll.run']) && audited() && incoming().status == 'draft' && incoming().lines is list;
+      allow update: if canAny(['payroll.run']) && audited() && (
+        (existing().status == 'draft' && incoming().status in ['draft', 'posted'] && incoming().lines is list)
+        || (existing().status == 'posted' && incoming().status == 'paid'
+            && changedOnly(['status', 'paidBy', 'paidAt', 'payAccountId', 'journalIds', 'auditId', 'updatedAt', 'updatedBy']))
+      );
+      allow delete: if false;
+    }
+
+    // ---------- صور الصفحة التعريفية: عامة القراءة، ولا تُكتب إلا صورة JPEG/WebP مضغوطة ----------
+    match /publicMedia/{id} {
+      allow read: if true;
+      allow create, update: if canAny(['settings.write']) && audited()
+        && incoming().data is string && incoming().data.size() < 450000
+        && incoming().data.matches('data:image/(jpeg|webp);base64,[A-Za-z0-9+/=]+');
+      allow delete: if false;
+    }
+
+    // ---------- طلبات عروض الأسعار من الصفحة التعريفية ----------
+    // أي زائر يستطيع إرسال طلب واحد بحقول محددة وأحجام محدودة، ولا يستطيع قراءة الطلبات
+    match /leads/{id} {
+      allow create: if incoming().keys().hasOnly(['name', 'phone', 'city', 'workType', 'message', 'status', 'at'])
+        && incoming().status == 'new' && incoming().at == request.time
+        && incoming().name is string && incoming().name.size() >= 2 && incoming().name.size() <= 80
+        && incoming().phone is string && incoming().phone.matches('^[+]?[0-9]{9,14}$')
+        && incoming().city is string && incoming().city.size() <= 40
+        && incoming().workType is string && incoming().workType.size() <= 80
+        && incoming().message is string && incoming().message.size() <= 800;
+      allow read: if canAny(['customer.write', 'audit.view']);
+      allow update: if canAny(['customer.write']) && audited()
+        && incoming().status in ['new', 'contacted', 'won', 'lost']
+        && changedOnly(['status', 'note', 'customerId', 'handledBy', 'handledAt', 'auditId', 'updatedAt', 'updatedBy']);
+      allow delete: if false;
+    }
+
+    // أي مسار آخر مرفوض
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
