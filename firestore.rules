@@ -1,7 +1,7 @@
 rules_version = '2';
 
 // =====================================================================
-// قواعد حماية Firestore — الحرف المتكاملة للمقاولات
+// قواعد حماية Firestore — سوبريم للأبواب والألمنيوم
 // ---------------------------------------------------------------------
 // المبادئ:
 //  1) لا يقرأ أحد شيئاً إلا مستخدم نشط مسجّل في users (أو المالك "1").
@@ -19,7 +19,7 @@ service cloud.firestore {
     // ---------- الهوية والصلاحيات ----------
     function signedIn() { return request.auth != null && request.auth.token.email is string; }
     function uname() { return request.auth.token.email.split('@')[0]; }
-    function isOwner() { return signedIn() && request.auth.token.email == '1@al-hiraf.app'; }
+    function isOwner() { return signedIn() && request.auth.token.email == '1@supreme-doors.app'; }
     function me() { return get(/databases/$(database)/documents/users/$(uname())).data; }
     function isMember() { return isOwner() || (signedIn() && me().active == true); }
     function hasAnyPerm(ps) { let u = me(); return u.active == true && u.perms.hasAny(ps); }

@@ -1,15 +1,13 @@
 /* =====================================================================
    إعدادات Firebase — نسخة سوبريم للأبواب والألمنيوم
-   ضع هنا إعدادات مشروع Firebase الخاص بسوبريم (مشروع مستقل عن الحرف المتكاملة
-   حتى تبقى البيانات منفصلة تماماً). ما دامت القيمة تبدأ بكلمة «ضع» يعمل النظام
-   تجريبياً داخل المتصفح فقط.
+   مشروع supreme-doors-e8f10 (مستقل تماماً عن بيانات الحرف المتكاملة).
    هذه القيم ليست سرّية؛ الحماية تكون بقواعد Firestore (ملف firestore.rules).
    ===================================================================== */
 window.HIRAF_FIREBASE = {
-  apiKey: "ضع apiKey هنا",
-  authDomain: "",
-  projectId: "",
-  storageBucket: "",
-  messagingSenderId: "",
-  appId: ""
+  apiKey: "AIzaSyB_b_pCn42K85KqcjlksqyZk-u5157kuIg",
+  authDomain: "supreme-doors-e8f10.firebaseapp.com",
+  projectId: "supreme-doors-e8f10",
+  storageBucket: "supreme-doors-e8f10.firebasestorage.app",
+  messagingSenderId: "1065005094725",
+  appId: "1:1065005094725:web:e9ec61e6e5cfac0e5fd02c"
 };
