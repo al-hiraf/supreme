@@ -312,6 +312,86 @@ const LocalDB = {
   },
 };
 
+/* =====================================================================
+   3-ج) نقل بيانات الحفظ المحلي القديم (قبل ربط Firebase) إلى قاعدة البيانات الأونلاين
+   يُشغَّل من كل جهاز فيه بيانات قديمة، بالمستخدم 1. لا يكتب فوق أي سجل موجود في السحابة.
+   ===================================================================== */
+const IMPORT_SKIP = new Set(['users']); // حسابات الدخول المحلية لا تنتقل؛ مستخدمو السحابة يُنشؤون عند التهيئة
+const IMPORT_LABEL = { customers: 'عميل', invoices: 'فاتورة', payments: 'سند قبض', purchases: 'فاتورة مشتريات', journals: 'قيد', items: 'صنف', employees: 'موظف', assets: 'أصل', leads: 'طلب عرض سعر' };
+const IMPORT_NUM = { invoices: 'number', payments: 'no', purchases: 'no', journals: 'no' };
+const IMPORT_FLAG = SP + '-imported-v1';
+function localLegacy() {
+  const st = local.get(LocalDB.KEY, null);
+  if (!st || typeof st !== 'object') return null;
+  const counts = {};
+  for (const c of COLLS) if (!IMPORT_SKIP.has(c) && st[c] && typeof st[c] === 'object') { const n = Object.keys(st[c]).length; if (n) counts[c] = n; }
+  return Object.keys(IMPORT_LABEL).some((c) => counts[c]) ? { st, counts } : null;
+}
+const legacySummary = (counts) => Object.entries(IMPORT_LABEL).filter(([c]) => counts[c]).map(([c, l]) => `${counts[c]} ${l}`).join('، ');
+
+/** يقارن بيانات هذا الجهاز بالسحابة: ما الجديد، وما الموجود، وأي أرقام مستندات مكررة */
+async function planImport() {
+  if (S.db.mode !== 'cloud' || S.user.username !== OWNER) throw new H.InputError('الرفع متاح للمستخدم 1 بعد الربط بالسحابة');
+  const lg = localLegacy();
+  if (!lg) throw new H.InputError('لا توجد بيانات قديمة على هذا الجهاز');
+  const { collection, getDocs } = S.db.fb;
+  const jobs = [], dup = [];
+  let skipped = 0, counters = null;
+  for (const c of Object.keys(lg.counts)) {
+    const snap = await getDocs(collection(S.db.db, c));
+    const have = new Map(snap.docs.map((d) => [d.id, d.data()]));
+    const nums = IMPORT_NUM[c] ? new Set([...have.values()].map((d) => d[IMPORT_NUM[c]]).filter(Boolean)) : null;
+    for (const [id, data] of Object.entries(lg.st[c])) {
+      if (!data || typeof data !== 'object') continue;
+      if (c === 'settings' && id === 'counters') { counters = { local: data, cloud: have.get(id) || null }; continue; }
+      if (have.has(id)) { skipped++; continue; }
+      const v = structuredClone(data);
+      delete v.id;
+      if ((c === 'audit' || c === 'leads') && typeof v.at === 'string' && !Number.isNaN(Date.parse(v.at))) v.at = new Date(v.at);
+      if (nums && v[IMPORT_NUM[c]] && nums.has(v[IMPORT_NUM[c]])) dup.push(v[IMPORT_NUM[c]]);
+      jobs.push([c, id, v]);
+    }
+  }
+  return { jobs, skipped, counters, dup };
+}
+
+/** ينفّذ الرفع: كل سجل في طلب مستقل (حتى لا تتجاوز قواعد Firestore حدها)، والعدّادات تأخذ الأكبر */
+async function runImport(plan) {
+  const { doc, collection, setDoc, serverTimestamp } = S.db.fb;
+  const db = S.db.db, queue = [...plan.jobs], failed = [];
+  let done = 0;
+  const worker = async () => {
+    while (queue.length) {
+      const [c, id, v] = queue.shift();
+      try { await setDoc(doc(db, c, id), v); done++; } catch (e) { failed.push(`${c}/${id}: ${e.code || e.message}`); }
+    }
+  };
+  await Promise.all(Array.from({ length: 6 }, worker));
+  if (plan.counters) {
+    const cloud = plan.counters.cloud || {}, merged = { ...cloud };
+    for (const [k, n] of Object.entries(plan.counters.local)) if (typeof n === 'number') merged[k] = Math.max(n, typeof cloud[k] === 'number' ? cloud[k] : 0);
+    delete merged.id;
+    try { await setDoc(doc(db, 'settings', 'counters'), merged); } catch (e) { failed.push('settings/counters: ' + (e.code || e.message)); }
+  }
+  try {
+    await setDoc(doc(collection(db, 'audit')), { at: serverTimestamp(), actor: S.user.username, actorName: S.user.name, action: 'import', entity: 'system', entityId: 'local-import',
+      summary: H.cleanText(`رفع بيانات الحفظ المحلي من جهاز إلى السحابة: ${done} سجل${failed.length ? `، تعذّر ${failed.length}` : ''}`, 300) });
+  } catch (e) { console.warn(e); }
+  if (failed.length) console.warn('تعذّر رفع:', failed);
+  else local.set(IMPORT_FLAG, nowISO());
+  return { done, failed: failed.length };
+}
+
+/** بطاقة الرفع في الإعدادات ← قاعدة البيانات */
+function importCard() {
+  const lg = S.db.mode === 'cloud' ? localLegacy() : null;
+  if (!lg) return '';
+  const when = local.get(IMPORT_FLAG, null);
+  const head = `<p class="cell-sub mt"><b>على هذا الجهاز بيانات قديمة من فترة الحفظ المحلي:</b> ${esc(legacySummary(lg.counts))}.${when ? ` رُفعت للسحابة بتاريخ ${esc(when.slice(0, 10))}.` : ''}</p>`;
+  if (S.user.username !== OWNER) return head + '<p class="cell-sub">لرفعها للسحابة: ادخل من هذا الجهاز بالمستخدم 1 ثم افتح الإعدادات.</p>';
+  return head + `<p class="cell-sub" id="importNote"></p>${btn('import-local', when ? 'رفعها مرة أخرى (يتخطى الموجود)' : 'رفع بيانات هذا الجهاز للسحابة', { cls: 'btn-primary btn-sm', ic: 'upload' })}`;
+}
+
 const BAD_LOGIN = 'اسم المستخدم أو كلمة المرور غير صحيحة';
 function fbError(e) {
   const map = {
@@ -1332,6 +1412,7 @@ async function afterSignIn(username) {
   if (!u.active) throw new Error('تم إيقاف هذا المستخدم. راجع مدير النظام');
   S.user = { username, name: u.name, role: u.role, perms: u.perms || [], active: u.active };
   enterApp();
+  if (S.db.mode === 'cloud' && username === OWNER && localLegacy() && !local.get(IMPORT_FLAG, null)) setTimeout(() => toast('على هذا الجهاز بيانات قديمة لم تُرفع', 'ارفعها من الإعدادات ← قاعدة البيانات'), 1500);
 }
 
 function showLogin() {
@@ -2638,7 +2719,7 @@ function renderSettings() {
           <div class="field"><label for="pwNew2">تأكيد كلمة المرور</label><input class="input" id="pwNew2" type="password" autocomplete="new-password"></div>
           <button class="btn btn-ghost" type="submit">${icon('lock')}تغيير كلمة المرور</button></form></div>
       <div class="card"><div class="card-head"><h3>قاعدة البيانات</h3></div><div class="card-body">
-        ${S.db.mode === 'cloud' ? '<span class="pill ok">أونلاين — مباشر</span><p class="cell-sub mt">البيانات في Firebase، وكل عملية تظهر فوراً عند جميع المستخدمين.</p>'
+        ${S.db.mode === 'cloud' ? '<span class="pill ok">أونلاين — مباشر</span><p class="cell-sub mt">البيانات في Firebase، وكل عملية تظهر فوراً عند جميع المستخدمين.</p>' + importCard()
           : `<span class="pill warn">حفظ محلي</span><p class="cell-sub mt">لم يُربط Firebase بعد؛ البيانات في هذا المتصفح فقط.</p>
              ${S.user.username === OWNER ? btn('wipe-local', 'مسح كل البيانات المحلية', { cls: 'btn-danger btn-sm', ic: 'trash' }) : ''}`}</div></div>
     </div></div>
@@ -3329,6 +3410,27 @@ const ACTIONS = {
   'delete-user': (el) => { if (confirmTwice(el, 'تأكيد الحذف')) run(el, () => Services.setUserActive(el.dataset.id, false, true), ['حُذف المستخدم', 'يبقى تاريخه في سجل المراجعة'], { close: false }); },
   export: (el) => exportWhat(el.dataset.what, el.dataset.key),
   print: (el) => { need('reports.export'); const r = reportData(el.dataset.key); printHTML(r.title, r.period, r.html); },
+  'import-local': async (el) => {
+    const note = $('#importNote');
+    if (el.dataset.ready !== '1') {
+      busy(el, true);
+      try { S.importPlan = await planImport(); } catch (err) { busy(el, false); toast('تعذّر قراءة البيانات', err instanceof H.InputError ? err.message : fbError(err), 'error'); return; }
+      busy(el, false);
+      const p = S.importPlan;
+      if (!p.jobs.length && !p.counters) { toast('لا جديد للرفع', 'كل بيانات هذا الجهاز موجودة في السحابة'); return; }
+      if (note) note.innerHTML = `سيُرفع <b>${p.jobs.length}</b> سجل جديد، ويُتخطى ${p.skipped} موجود مسبقاً.`
+        + (p.dup.length ? `<br><span class="pill warn">تنبيه</span> ${p.dup.length} رقم مستند موجود في السحابة من جهاز آخر (مثل ${esc(p.dup.slice(0, 3).join('، '))}) — ستظهر بنفس الرقم مرتين.` : '');
+      el.dataset.ready = '1'; el.innerHTML = `${icon('check')}تأكيد الرفع`;
+      return;
+    }
+    el.dataset.ready = '';
+    const r = await run(el, () => runImport(S.importPlan), null, { close: false });
+    S.importPlan = null;
+    if (!r) return;
+    if (r.failed) toast(`رُفع ${r.done} سجل وتعذّر ${r.failed}`, 'أعد المحاولة؛ الرفع يتخطى ما رُفع سابقاً', 'error');
+    else toast(`تم رفع ${r.done} سجل للسحابة`, 'تظهر الآن عند جميع المستخدمين');
+    render();
+  },
   'wipe-local': (el) => { if (confirmTwice(el)) { local.del(LocalDB.KEY); local.del(LocalDB.AUTH); sess.del(SP + '-local-user'); location.reload(); } },
 };
 

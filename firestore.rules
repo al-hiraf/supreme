@@ -283,6 +283,14 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // ---------- نقل بيانات الحفظ المحلي القديم إلى السحابة ----------
+    // للمالك فقط، إضافة سجلات جديدة فقط (لا تعديل لأي سجل موجود سوى العدّادات)، وتُقفل تلقائياً بعد التاريخ المحدد
+    function importOpen() { return isOwner() && request.time < timestamp.date(2026, 11, 20); }
+    match /{coll}/{id} {
+      allow create: if importOpen() && coll != 'users';
+      allow update: if importOpen() && coll == 'settings' && id == 'counters';
+    }
+
     // أي مسار آخر مرفوض
     match /{document=**} {
       allow read, write: if false;
